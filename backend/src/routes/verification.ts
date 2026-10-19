@@ -21,13 +21,71 @@ const reportStore = new Map<string, VerificationReport>();
 import { createChallenge, consumeChallenge } from "../services/challengeStore.js";
 import { verifyEvmSignature } from "../services/evm.js";
 import { verifySolanaSignature } from "../services/solana.js";
-import { upsertApplicant, createVerificationResult } from "../services/db.js";
+import { upsertApplicant, createVerificationResult, getNotificationPreference } from "../services/db.js";
 import {
   evaluateLoginLocation,
   recordLoginLocation,
   generateStepUpCode,
   verifyStepUpCode,
+  LocationCheckResult,
 } from "../services/locationAnomalyService.js";
+import { logAudit } from "../services/audit.js";
+import { sendEmail, getBrandedHtml } from "../services/email.js";
+
+/**
+ * Best-effort email for a wallet, for the login-anomaly notification below.
+ * Applicants have no dedicated email field — `NotificationPreference.email`
+ * is the real one when set; otherwise falls back to the same
+ * `<address>@example.com` placeholder `kycExpiryReminder.ts` already uses
+ * when no real address is on file.
+ */
+async function resolveNotificationEmail(walletAddress: string): Promise<string> {
+  const preference = await getNotificationPreference(walletAddress);
+  return preference?.email || `${walletAddress}@example.com`;
+}
+
+/**
+ * Notifies the user of a high-risk login and records it in the audit trail.
+ * Fire-and-forget from the caller's perspective — a notification failure
+ * should never block the step-up flow the user is already in.
+ */
+async function notifyLoginAnomaly(
+  walletAddress: string,
+  clientIp: string,
+  check: LocationCheckResult
+): Promise<void> {
+  await logAudit({
+    action: "login.location.anomaly",
+    actorAddress: walletAddress,
+    ipAddress: clientIp,
+    metadata: {
+      reason: check.reason,
+      country: check.currentLocation.country,
+      previousCountry: check.previousLocation?.country,
+      speedKmH: check.calculatedSpeedKmH,
+    },
+  });
+
+  try {
+    const email = await resolveNotificationEmail(walletAddress);
+    const html = getBrandedHtml(
+      "Unusual Login Detected",
+      `
+        <h2>Unusual Login Detected</h2>
+        <p>We noticed a login to your account that doesn't match your usual
+           pattern: <strong>${check.reason ?? "unfamiliar location"}</strong>.</p>
+        <p>We've required an extra verification step before this session is
+           allowed to proceed. If this was you, complete the step-up
+           verification to continue. If it wasn't, your account has not been
+           accessed — no further action is needed, but consider rotating any
+           credentials you can.</p>
+      `
+    );
+    await sendEmail(email, "Unusual Login Detected on Your Account", html);
+  } catch (err) {
+    logger.error("[login-anomaly] failed to send notification email", { error: err, walletAddress });
+  }
+}
 
 export const verificationRouter = Router();
 
@@ -53,10 +111,29 @@ export const verificationRouter = Router();
  *     responses:
  *       200:
  *         description: Remittance analysis completed.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               allOf:
+ *                 - $ref: '#/components/schemas/RemittanceAnalysis'
+ *                 - type: object
+ *                   required: [reportId, generatedAt, reportHash]
+ *                   properties:
+ *                     reportId: { type: string, format: uuid }
+ *                     generatedAt: { type: string, format: date-time }
+ *                     reportHash: { type: string }
  *       400:
- *         description: Required request fields are missing.
+ *         description: Required request fields are missing or malformed.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ValidationErrorResponse'
  *       500:
  *         description: Verification service failed unexpectedly.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ErrorResponse'
  */
 verificationRouter.post("/check", validateVerificationBody, async (req, res) => {
   try {
@@ -74,7 +151,7 @@ verificationRouter.post("/check", validateVerificationBody, async (req, res) => 
 
     // Persist applicant and verification result — non-blocking on failure
     try {
-      const { score } = calculateCreditScore(analysis);
+      const { score, modelVersion, breakdown, reasons } = calculateCreditScore(analysis);
       const applicant = await upsertApplicant(senderAddress, {
         verificationStatus: analysis.eligible ? "ELIGIBLE" : "INELIGIBLE",
         creditScore: score,
@@ -86,6 +163,10 @@ verificationRouter.post("/check", validateVerificationBody, async (req, res) => 
         totalVolume: Number(analysis.totalAmountUSDC),
         spanMonths: analysis.spanMonths,
         eligible: analysis.eligible,
+        score,
+        modelVersion,
+        scoreBreakdown: breakdown,
+        scoreReasons: reasons,
       });
     } catch (dbErr) {
       console.error("DB persist error (non-fatal):", dbErr);
@@ -231,6 +312,13 @@ verificationRouter.post("/score", validateVerificationBody, async (req, res) => 
  *     responses:
  *       200:
  *         description: Challenge string to sign.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               required: [challenge]
+ *               properties:
+ *                 challenge: { type: string }
  *       400:
  *         description: Invalid or missing walletAddress / network.
  */
@@ -274,7 +362,7 @@ verificationRouter.post("/challenge", verificationChallengeRateLimiter, validate
  *       410:
  *         description: Challenge expired or already used.
  */
-verificationRouter.post("/verify-ownership", verificationOwnershipRateLimiter, validateMultiChainOwnership, (req, res) => {
+verificationRouter.post("/verify-ownership", verificationOwnershipRateLimiter, validateMultiChainOwnership, async (req, res) => {
   const { walletAddress, network, challenge, signature } = req.body;
 
   if (!challenge || !signature) {
@@ -310,10 +398,11 @@ verificationRouter.post("/verify-ownership", verificationOwnershipRateLimiter, v
   }
 
   const clientIp = (req.headers["x-forwarded-for"] as string) || req.ip || "127.0.0.1";
-  const locationCheck = evaluateLoginLocation(walletAddress, clientIp);
+  const locationCheck = await evaluateLoginLocation(walletAddress, clientIp);
 
   if (locationCheck.requiresStepUp) {
     const stepUpCode = generateStepUpCode(walletAddress);
+    await notifyLoginAnomaly(walletAddress, clientIp, locationCheck);
     res.status(202).json({
       verified: true,
       stepUpRequired: true,
@@ -326,7 +415,7 @@ verificationRouter.post("/verify-ownership", verificationOwnershipRateLimiter, v
     return;
   }
 
-  recordLoginLocation(walletAddress, clientIp);
+  await recordLoginLocation(walletAddress, clientIp);
 
   const token = jwt.sign(
     { walletAddress, network },
@@ -334,6 +423,7 @@ verificationRouter.post("/verify-ownership", verificationOwnershipRateLimiter, v
     { expiresIn: "24h" }
   );
 
+  res.clearCookie("session");
   res.cookie("token", token, {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
@@ -370,7 +460,7 @@ verificationRouter.post("/verify-ownership", verificationOwnershipRateLimiter, v
  *       401:
  *         description: Invalid or expired confirmation code.
  */
-verificationRouter.post("/step-up", (req, res) => {
+verificationRouter.post("/step-up", async (req, res) => {
   const { walletAddress, network, code } = req.body;
 
   if (!walletAddress || !code) {
@@ -385,7 +475,12 @@ verificationRouter.post("/step-up", (req, res) => {
   }
 
   const clientIp = (req.headers["x-forwarded-for"] as string) || req.ip || "127.0.0.1";
-  recordLoginLocation(walletAddress, clientIp);
+  await recordLoginLocation(walletAddress, clientIp);
+  await logAudit({
+    action: "login.stepup.verified",
+    actorAddress: walletAddress,
+    ipAddress: clientIp,
+  });
 
   const token = jwt.sign(
     { walletAddress, network: network || "stellar" },
@@ -393,6 +488,7 @@ verificationRouter.post("/step-up", (req, res) => {
     { expiresIn: "24h" }
   );
 
+  res.clearCookie("session");
   res.cookie("token", token, {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",

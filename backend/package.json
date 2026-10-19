@@ -10,13 +10,18 @@
     "docs:export": "tsx src/docs/export-openapi.ts",
     "test": "jest",
     "test:coverage": "jest --coverage",
+    "test:mutation": "stryker run",
+    "test:security": "jest src/__tests__/sessionFixationAndReplay.test.ts",
     "test:integration": "jest --testPathPattern='prismaSchemaDrift' --no-coverage",
     "test:drift": "jest src/__tests__/prismaSchemaDrift.test.ts --no-coverage",
+    "test:openapi": "jest src/__tests__/openapiResponseValidation.test.ts --no-coverage",
     "drift:check": "bash ./scripts/detect-prisma-drift.sh",
     "drift:check:ci": "bash ./scripts/detect-prisma-drift.sh --exit-code",
     "drift:sync": "bash ./scripts/sync-production-schema.sh --from-schema=prisma/schema.prisma",
+    "drift:check:cors": "bash ./scripts/detect-cors-drift.sh",
     "db:migrate": "prisma migrate dev",
     "db:seed": "tsx prisma/seed.ts",
+    "backup:restore-drill": "tsx scripts/restore-latest-backup.ts",
     "anonymize:staging-seed": "tsx scripts/anonymize-staging-seed.ts",
     "load-test": "tsx load-tests/run-all.ts",
     "load-test:health": "tsx load-tests/scenarios/health-read.ts",
@@ -26,7 +31,8 @@
     "load-test:verify": "tsx load-tests/scenarios/verification-write.ts",
     "load-test:mixed": "tsx load-tests/scenarios/mixed-workload.ts",
     "load-test:month-end": "tsx load-tests/scenarios/month-end-payment-spike.ts",
-    "load-test:bulk-approval": "tsx load-tests/scenarios/bulk-approval.ts"
+    "load-test:bulk-approval": "tsx load-tests/scenarios/bulk-approval.ts",
+    "load-test:webhook-burst": "tsx load-tests/scenarios/webhook-burst.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.709.0",
@@ -69,6 +75,8 @@
   },
   "devDependencies": {
     "@sentry/cli": "^3.6.2",
+    "@stryker-mutator/core": "~10.0.0",
+    "@stryker-mutator/jest-runner": "~10.0.0",
     "@types/bs58": "^4.0.4",
     "@types/cookie-parser": "^1.4.10",
     "@types/cors": "^2.8.17",
@@ -96,6 +104,9 @@
   "jest": {
     "preset": "ts-jest",
     "testEnvironment": "node",
+    "setupFilesAfterEnv": [
+      "<rootDir>/test/flakyQuarantine.cjs"
+    ],
     "roots": [
       "<rootDir>/src"
     ],

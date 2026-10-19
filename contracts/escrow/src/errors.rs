@@ -65,4 +65,48 @@ pub enum EscrowError {
     InsufficientBalance = 37,
     /// Auto-deposit interval must be greater than zero ledgers.
     InvalidAutoDepositInterval = 38,
+    /// Beneficiary has not been configured for this goal.
+    BeneficiaryNotConfigured = 25,
+    /// Caller is not the designated beneficiary for this goal.
+    UnauthorizedBeneficiary = 26,
+    /// The owner-inactivity period has not yet elapsed.
+    BeneficiaryInactivityNotElapsed = 27,
+    /// Not enough valid attestations to satisfy the configured quorum.
+    InsufficientAttestationQuorum = 28,
+    /// One or more attestations were invalid or from unknown signers.
+    InvalidAttestation = 29,
+    /// The beneficiary has already claimed this goal.
+    BeneficiaryAlreadyClaimed = 30,
+    /// There are no funds available to claim.
+    NoClaimableFunds = 31,
+    /// The inactivity period must be greater than zero ledgers.
+    InvalidInactivityPeriod = 32,
+    /// Attestor configuration must have a non-empty signer set and a valid threshold.
+    InvalidAttestorConfig = 33,
+    /// Beneficiary split shares do not sum to exactly 10 000 basis points (100 %).
+    InvalidBeneficiaryShares = 39,
+    /// Beneficiary list exceeds the maximum allowed number of recipients.
+    BeneficiaryListTooLarge = 40,
+    /// No pending attestor-threshold change exists to apply or cancel.
+    AttestorChangeProposalNotPending = 41,
+    /// A hardship withdrawal request already exists for this goal.
+    HardshipRequestAlreadyExists = 42,
+    /// No hardship withdrawal request exists for this goal.
+    HardshipRequestNotFound = 43,
+    /// The hardship request's approval window has elapsed.
+    HardshipRequestExpired = 44,
+    /// The hardship request has not been approved by the admin yet.
+    HardshipRequestNotApproved = 45,
+    /// The hardship withdrawal exceeds the per-period cap.
+    HardshipAmountExceedsCap = 46,
+    /// The goal's confirmed scheduled release time has not been reached yet.
+    ReleaseTimeNotReached = 47,
+    /// Proposed release time is in the past, too far out, or moves the
+    /// confirmed date further than the configured limit allows.
+    InvalidReleaseTime = 48,
+    /// The goal's release time cannot be rescheduled again: the reschedule
+    /// count or minimum interval limit was hit, or the date already passed.
+    RescheduleLimitReached = 49,
+    /// There is no pending release time proposal to confirm.
+    NoPendingReleaseTime = 50,
 }
