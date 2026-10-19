@@ -6,6 +6,7 @@ import dynamic from "next/dynamic";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { getProductTourStore } from "@/hooks/useProductTourState";
 import { useThemeStore } from "@/app/stores/useThemeStore";
+import ThemeModeSettings from "@/components/ThemeModeSettings";
 import NotificationFrequencyControl, {
   type NotificationFrequency,
 } from "@/components/NotificationFrequencyControl";
@@ -17,11 +18,21 @@ const PushNotificationPanel = dynamic(
   () => import("../../components/PushNotificationPanel"),
   { ssr: false }
 );
+const RecoveryCodesManager = dynamic(() => import("../../components/RecoveryCodesManager"), {
+  ssr: false,
+});
 const ReferralInvitePanel = dynamic(() => import("../../components/ReferralInvitePanel"), {
   ssr: false,
 });
 
-type SettingsTab = "profile" | "wallets" | "notifications" | "referrals" | "contractor" | "appearance";
+type SettingsTab =
+  | "profile"
+  | "wallets"
+  | "notifications"
+  | "security"
+  | "referrals"
+  | "contractor"
+  | "appearance";
 
 type NotificationKey =
   | "emailAlerts"
@@ -42,6 +53,7 @@ const tabs: { id: SettingsTab; label: string }[] = [
   { id: "profile", label: "Profile" },
   { id: "wallets", label: "Wallets" },
   { id: "notifications", label: "Notifications & Alerts" },
+  { id: "security", label: "Security" },
   { id: "referrals", label: "Referrals" },
   { id: "contractor", label: "Developer/Contractor" },
   { id: "appearance", label: "Appearance" },
@@ -674,6 +686,18 @@ export default function SettingsPage() {
                 </section>
               )}
 
+              {activeTab === "security" && (
+                <section role="tabpanel" aria-label="Security settings" className="space-y-6">
+                  <div>
+                    <h2 className="text-2xl font-bold text-white">Security</h2>
+                    <p className="text-slate-400 text-sm mt-1">
+                      Manage two-factor authentication recovery so you can always get back into your account.
+                    </p>
+                  </div>
+                  <RecoveryCodesManager />
+                </section>
+              )}
+
               {activeTab === "referrals" && (
                 <section role="tabpanel" aria-label="Referral settings" className="space-y-6">
                   <ReferralInvitePanel ownerAddress={stellarAddress} />
@@ -736,7 +760,9 @@ export default function SettingsPage() {
                     </p>
                   </div>
 
-                  {/* Theme: Light / Dark */}
+                  <ThemeModeSettings />
+
+                  {/* Theme: Light / Dark (picking one switches to Manual mode) */}
                   <div className="space-y-3">
                     <h3 className="text-xs font-bold uppercase tracking-wider text-cyan-400">Color Theme</h3>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
