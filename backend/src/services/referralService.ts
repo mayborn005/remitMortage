@@ -1,3 +1,6 @@
+// Copyright (c) 2026 RemitMortgage Protocol Contributors
+// SPDX-License-Identifier: MIT
+
 import { createHash } from "crypto";
 import { prisma } from "./db.js";
 
@@ -88,7 +91,7 @@ export async function getReferralStats(ownerAddress: string) {
     };
   }
 
-  const referredAddresses = referral.attributions.map((a) => a.referredAddress);
+  const referredAddresses = referral.attributions.map((a: any) => a.referredAddress);
   const convertedApplicants = referredAddresses.length
     ? await prisma.applicant.findMany({
         where: {
@@ -107,7 +110,7 @@ export async function getReferralStats(ownerAddress: string) {
     inviteLink: `${baseUrl}/onboarding?ref=${encodeURIComponent(referral.code)}`,
     invitesSent: referral.attributions.length,
     conversions: convertedApplicants.length,
-    recentAttributions: referral.attributions.slice(0, 10).map((a) => ({
+    recentAttributions: referral.attributions.slice(0, 10).map((a: any) => ({
       referredAddress: a.referredAddress,
       createdAt: a.createdAt.toISOString(),
     })),
