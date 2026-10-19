@@ -1,6 +1,11 @@
+// Copyright (c) 2026 RemitMortgage Protocol Contributors
+// SPDX-License-Identifier: MIT
+
 import { randomUUID } from "node:crypto";
 import { prisma } from "./db.js";
 import { queueService, type AnalyticsJobData } from "./queueService.js";
+
+export type { AnalyticsJobData };
 import { loadConfig } from "../config.js";
 import logger from "../utils/logger.js";
 

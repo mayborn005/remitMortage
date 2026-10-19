@@ -1,7 +1,11 @@
+// Copyright (c) 2026 RemitMortgage Protocol Contributors
+// SPDX-License-Identifier: MIT
+
 import { PrismaClient, Prisma } from "@prisma/client";
 import { createHash } from "crypto";
 
 import { encrypt, decrypt } from "../utils/crypto.js";
+import { hashTaxId } from "../utils/taxIdHash.js";
 import {
   buildDatabaseUrl,
   resolveReadReplicaSettings,
@@ -10,6 +14,15 @@ import {
   createDbPoolMetricsExtension,
   initDbPoolMetrics,
 } from "./dbPoolMetrics.js";
+import {
+  startLeakDetector,
+  createLeakDetectorExtension,
+} from "./dbConnectionLeakDetector.js";
+import {
+  createPrismaSlowQueryStore,
+  createSlowQueryLoggingExtension,
+  getSlowQueryThresholdMs,
+} from "./slowQueryLog.js";
 import { configuredSecretId, secrets } from "./secretsManager.js";
 
 export type VerificationStatus = "PENDING" | "ELIGIBLE" | "INELIGIBLE";
@@ -30,9 +43,13 @@ const { url: replicaUrl, lagThresholdSeconds } = resolveReadReplicaSettings();
 function createPrismaClient(url: string | undefined): any {
   let baseClient: any;
   try {
-    baseClient = new PrismaClient(
-      url ? { datasources: { db: { url } } } : undefined
-    );
+    // `datasources` is a pre-v7 option; Prisma 7 requires a driver adapter
+    // (or Accelerate) instead. We still pass it when present because older
+    // runtimes read it, and cast because the v7 types no longer accept it.
+    const options = url
+      ? ({ datasources: { db: { url } } } as never)
+      : undefined;
+    baseClient = new PrismaClient(options);
   } catch {
   // Prisma v7 requires a driver adapter; when running in unit tests we
   // prefer a harmless in-process mock so imports don't throw during test
@@ -77,24 +94,90 @@ function createPrismaClient(url: string | undefined): any {
   // clients used in tests, and losing metrics is never a reason to take the
   // service down.
   initDbPoolMetrics();
+
+  // Start the leak-detection sweeper.  Safe to call multiple times — repeated
+  // calls from the read-replica client factory are no-ops.
+  startLeakDetector();
   if (typeof baseClient.$extends !== "function") return baseClient;
 
+  let client = baseClient;
   try {
-    const rows = (await (readReplicaPrisma as any).$queryRaw`SELECT COALESCE(EXTRACT(EPOCH FROM (NOW() - pg_last_xact_replay_timestamp()))::int, 0) AS lag_seconds`) as Array<{ lag_seconds: number | string | null }>;
-    const lag = Number(rows?.[0]?.lag_seconds ?? 0);
-    return Number.isFinite(lag) ? lag : null;
+    client = client.$extends(createDbPoolMetricsExtension());
   } catch {
-    return null;
+    // Metrics are best-effort; keep the base client if the extension fails.
   }
+
+  // Wrap every operation with the leak detector so long-held connections are
+  // flagged before they exhaust the pool.  Applied after the saturation metrics
+  // extension so both instruments see the same operation lifecycle.
+  try {
+    client = client.$extends(createLeakDetectorExtension());
+  } catch {
+    // Leak detection is best-effort; never take the service down over it.
+  }
+
+  // Capture operations that outrun the configurable slow-query threshold and
+  // persist them for the weekly digest (#583). The store writes back through
+  // this same client, so the extension skips its own model to avoid recursion.
+  try {
+    const slowQueryStore = createPrismaSlowQueryStore(client);
+    client = client.$extends(
+      createSlowQueryLoggingExtension({
+        thresholdMs: getSlowQueryThresholdMs(),
+        onSlowQuery: (entry) => {
+          void slowQueryStore.record(entry).catch(() => {
+            // Slow-query capture must never affect request handling.
+          });
+        },
+      })
+    );
+  } catch {
+    // Slow-query logging is best-effort.
+  }
+
+  return client;
 }
 
-export const prisma = createPrismaClient(dbUrl);
+let activeDbUrl = dbUrl;
+export let prisma = createPrismaClient(dbUrl);
 export const readReplicaPrisma =
   replicaUrl && buildDatabaseUrl({ ...process.env, DATABASE_URL: replicaUrl })
     ? createPrismaClient(buildDatabaseUrl({ ...process.env, DATABASE_URL: replicaUrl }))
     : prisma;
 
 export const READ_REPLICA_LAG_THRESHOLD_SECONDS = lagThresholdSeconds;
+
+/**
+ * Refresh the primary database pool after a Secrets Manager rotation.
+ * The replacement is health-checked before the exported client is swapped;
+ * the old pool then drains for the configured grace period.
+ */
+export async function refreshDatabaseCredentials(): Promise<void> {
+  const secretId = configuredSecretId("DATABASE_SECRET_ID");
+  if (!secretId) return;
+
+  const secret = await secrets.getJson(secretId, true);
+  const rawUrl = secret.databaseUrl ?? secret.url ?? secret.value;
+  if (!rawUrl) throw new Error(`Secret ${secretId} does not contain databaseUrl`);
+
+  const nextUrl = buildDatabaseUrl({ ...process.env, DATABASE_URL: rawUrl });
+  if (!nextUrl || nextUrl === activeDbUrl) return;
+
+  const nextClient = createPrismaClient(nextUrl);
+  await nextClient.$queryRaw`SELECT 1`;
+  const previousClient = prisma;
+  prisma = nextClient;
+  activeDbUrl = nextUrl;
+
+  const drainMs = Number(process.env.DB_ROTATION_DRAIN_MS || 30_000);
+  setTimeout(
+    () => {
+      void previousClient.$disconnect().catch(() => undefined);
+    },
+    Number.isFinite(drainMs) && drainMs >= 0 ? drainMs : 30_000
+  ).unref();
+}
+
 
 export async function getReadReplicaLagSeconds(): Promise<number | null> {
   if (!replicaUrl || readReplicaPrisma === prisma) {
@@ -119,7 +202,15 @@ export async function disconnect(): Promise<void> {
 
 // ── Applicant ─────────────────────────────────────────────────────────────
 
-const ENCRYPTED_FIELDS = ["taxId", "monthlyIncome"] as const;
+const ENCRYPTED_FIELDS = [
+  "taxId",
+  "monthlyIncome",
+  "addressLine1",
+  "addressLine2",
+  "addressCity",
+  "addressState",
+  "addressPostalCode",
+] as const;
 
 function encryptFields<T extends Record<string, any>>(data: T): T {
   const result: Record<string, any> = { ...data };
@@ -379,9 +470,22 @@ export async function upsertApplicant(
     creditScore?: number;
     taxId?: string;
     monthlyIncome?: string;
+    addressLine1?: string;
+    addressLine2?: string | null;
+    addressCity?: string;
+    addressState?: string;
+    addressPostalCode?: string;
+    addressCountry?: string;
+    addressVerificationStatus?: string;
+    addressVerificationDetail?: string | null;
+    addressVerifiedAt?: Date | null;
+    addressProviderReference?: string | null;
   }
 ) {
-  const encrypted = encryptFields(data);
+  const encrypted: Record<string, any> = encryptFields(data);
+  if (data.taxId) {
+    encrypted.taxIdHash = hashTaxId(data.taxId);
+  }
   return prisma.applicant.upsert({
     where: { stellarAddress },
     update: { ...encrypted, deletedAt: null, updatedAt: new Date() },
@@ -401,6 +505,52 @@ export async function getApplicant(stellarAddress: string) {
   return decryptApplicant(applicant);
 }
 
+/** Mailing address + verification metadata only, decrypted. Null if the applicant has never submitted one. */
+export async function getApplicantAddress(stellarAddress: string) {
+  const applicant = await prisma.applicant.findFirst({
+    where: { stellarAddress, deletedAt: null },
+    select: {
+      addressLine1: true,
+      addressLine2: true,
+      addressCity: true,
+      addressState: true,
+      addressPostalCode: true,
+      addressCountry: true,
+      addressVerificationStatus: true,
+      addressVerificationDetail: true,
+      addressVerifiedAt: true,
+      addressProviderReference: true,
+    },
+  });
+  if (!applicant || !applicant.addressVerificationStatus) return null;
+  return decryptApplicant(applicant);
+}
+
+/**
+ * Resolves an Applicant by Stellar address or internal id, auto-creating one
+ * if the identifier looks like a Stellar G-address and no record exists yet.
+ * Shared resolution logic for preference lookups (NotificationPreference,
+ * CommunicationPreference) that should all treat "user identifier" the same
+ * way. Returns null for an unresolvable, non-address identifier rather than
+ * creating a garbage record for it.
+ */
+export async function resolveOrCreateApplicant(stellarAddressOrId: string) {
+  const applicant = await prisma.applicant.findFirst({
+    where: {
+      deletedAt: null,
+      OR: [{ stellarAddress: stellarAddressOrId }, { id: stellarAddressOrId }],
+    },
+  });
+
+  if (applicant) return applicant;
+
+  if (stellarAddressOrId.startsWith("G") && stellarAddressOrId.length === 56) {
+    return prisma.applicant.create({ data: { stellarAddress: stellarAddressOrId } });
+  }
+
+  return null;
+}
+
 // ── VerificationResult ────────────────────────────────────────────────────
 
 export async function createVerificationResult(data: {
@@ -410,6 +560,10 @@ export async function createVerificationResult(data: {
   totalVolume: number;
   spanMonths: number;
   eligible: boolean;
+  score?: number;
+  modelVersion?: string;
+  scoreBreakdown?: Record<string, number>;
+  scoreReasons?: unknown;
 }) {
   return prisma.verificationResult.create({ data });
 }
@@ -448,6 +602,14 @@ export async function createLoanApplication(data: {
 
 // ── NotificationPreference ─────────────────────────────────────────────────
 
+/**
+ * How often a category's non-urgent alerts are delivered. Structurally
+ * identical to the generated Prisma enum of the same name, declared locally
+ * so this module doesn't require `prisma generate` to have run for a type
+ * check — the two are interchangeable at the Prisma Client boundary.
+ */
+export type NotificationFrequency = "IMMEDIATE" | "DAILY_DIGEST" | "WEEKLY_DIGEST";
+
 export type NotificationPreferenceData = {
   email?: string;
   phone?: string;
@@ -457,6 +619,12 @@ export type NotificationPreferenceData = {
   escrowReached?: boolean;
   paymentMissed?: boolean;
   loanMilestones?: boolean;
+  governanceAlerts?: boolean;
+  // Deliberately no `securityFrequency` — security-critical alerts are
+  // always immediate and are never controlled by a stored preference.
+  depositsFrequency?: NotificationFrequency;
+  milestonesFrequency?: NotificationFrequency;
+  governanceFrequency?: NotificationFrequency;
   webhookUrl?: string;
   timezone?: string;
   businessDays?: string;
@@ -661,6 +829,7 @@ export async function processUserDataDeletion(stellarAddress: string, reason?: s
       where: { id: applicant.id },
       data: {
         taxId: null,
+        taxIdHash: null,
         monthlyIncome: null,
         creditScore: null,
         verificationStatus: "INELIGIBLE",
@@ -672,7 +841,7 @@ export async function processUserDataDeletion(stellarAddress: string, reason?: s
 
     await prisma.loanApplication.updateMany({
       where: { applicantId: applicant.id },
-      data: { deletedAt: new Date() },
+      data: { deletedAt: new Date(), version: { increment: 1 } },
     });
     anonymizedFields.push("loanApplications");
 

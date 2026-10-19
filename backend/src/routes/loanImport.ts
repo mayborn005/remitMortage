@@ -1,7 +1,11 @@
+// Copyright (c) 2026 RemitMortgage Protocol Contributors
+// SPDX-License-Identifier: MIT
+
 import { Router } from "express";
 import multer from "multer";
 import logger from "../utils/logger.js";
 import { parseCsv, stageCsvImport } from "../services/csvImportService.js";
+import { quarantineUpload, scanForMalware } from "../services/malwareScanner.js";
 
 export const loanImportRouter = Router();
 
@@ -38,7 +42,21 @@ const upload = multer({
  *   - errors: per-row error details [{ rowNumber, field?, message }]
  *   - stagedIds: (dry-run only) placeholder IDs for each valid row
  */
-loanImportRouter.post("/", upload.single("file"), async (req, res) => {
+loanImportRouter.post("/", upload.single("file"), async (req, res, next) => {
+  if (!req.file) return next();
+  try {
+    const result = await scanForMalware(req.file.buffer);
+    if (result.status === "infected") {
+      const quarantineId = await quarantineUpload(req.file.buffer);
+      logger.error("[LoanImport] Malware upload quarantined", { quarantineId, signature: result.signature });
+      return res.status(422).json({ error: "infected_file", message: "This file was quarantined because it failed a security scan." });
+    }
+    next();
+  } catch (error) {
+    logger.error("[LoanImport] Malware scan unavailable; upload rejected", { error });
+    res.status(503).json({ error: "malware_scan_unavailable", message: "File scanning is temporarily unavailable. Please retry later." });
+  }
+}, async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({

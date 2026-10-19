@@ -1,9 +1,12 @@
+// Copyright (c) 2026 RemitMortgage Protocol Contributors
+// SPDX-License-Identifier: MIT
+
 import { Request, Response, NextFunction } from "express";
 import { StrKey } from "@stellar/stellar-sdk";
 
 export type Network = "stellar" | "ethereum" | "solana";
 
-function isValidGAddress(addr: unknown): boolean {
+export function isValidGAddress(addr: unknown): boolean {
   if (typeof addr !== "string") return false;
   if (addr.length !== 56) return false;
   if (!addr.startsWith("G")) return false;
