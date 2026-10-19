@@ -250,6 +250,21 @@ model VerificationResult {
   eligible       Boolean
   analyzedAt     DateTime  @default(now())
 
+  /// The computed credit score (0-100), stored alongside the inputs above so
+  /// a past verification's score is reproducible without re-running
+  /// `calculateCreditScore` against possibly-changed scoring weights.
+  score          Int?
+  /// The scoring model version active when this score was computed
+  /// (`ScoringModelConfig.activeVersion`, e.g. "v1.0.0").
+  modelVersion   String?
+  /// Per-factor point breakdown (consistency/frequency/duration/volume),
+  /// mirroring `CreditScoreResult.breakdown`.
+  scoreBreakdown Json?
+  /// The stable reason codes + plain-language text behind the score
+  /// (`CreditScoreResult.reasons`), so an adverse-decision notice or the
+  /// reviewer view can show *why* without recomputing anything.
+  scoreReasons   Json?
+
   // Index backing getApplicant() which orders verificationResults by analyzedAt desc
   @@index([applicantId, analyzedAt])
   // Supports eligibility-filtered queries and analytics scans
@@ -449,6 +464,26 @@ model OfferingWatch {
   @@unique([investorAddress, loanApplicationId])
   @@index([loanApplicationId, notifiedAt])
   @@index([investorAddress])
+}
+
+/// Accredited-investor re-verification tracking (issue #725). One row per
+/// investor wallet, created when accreditation is first captured. The next
+/// deadline is derived from `lastVerifiedAt` plus the configured interval, so
+/// changing the interval never requires rewriting rows. The two reminder
+/// timestamps make the sweep idempotent and are cleared on every successful
+/// re-verification.
+model InvestorAccreditation {
+  id                 String    @id @default(uuid())
+  investorAddress    String    @unique
+  lastVerifiedAt     DateTime
+  /// Set when the "deadline approaching" reminder has been sent.
+  reminderSentAt     DateTime?
+  /// Set when the follow-up for a missed deadline has been sent.
+  missedReminderSentAt DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  @@index([lastVerifiedAt])
 }
 
 enum ServicingTransferStatus {
@@ -654,6 +689,24 @@ enum SuspiciousActivityStatus {
   CONFIRMED
 }
 
+/// Coarse-only login location history, used for geo-IP anomaly detection
+/// (impossible travel, first-login-from-new-country). Deliberately omits the
+/// IP address, city, or any field finer-grained than country + rounded
+/// lat/lon — only enough precision to compute travel distance, never a
+/// precise location.
+model LoginLocationHistory {
+  id            String   @id @default(uuid())
+  walletAddress String
+  country       String
+  /// Rounded to ~1 decimal degree (~11km) at write time — coarse by
+  /// construction, not just by convention.
+  latitude      Float
+  longitude     Float
+  loginAt       DateTime @default(now())
+
+  @@index([walletAddress, loginAt])
+}
+
 model LoanDisbursement {
   id          String   @id @default(uuid())
   borrower    Borrower @relation(fields: [borrowerId], references: [id])
@@ -680,6 +733,44 @@ model LoanRepayment {
 
   @@index([borrowerId])
   @@index([ledger])
+}
+
+/// PII-minimized, versioned events waiting for delivery to the analytics
+/// warehouse. Producers insert in the same PostgreSQL transaction as source
+/// records; a relay can publish rows and set publishedAt after acknowledgement.
+model AnalyticsOutbox {
+  id            BigInt    @id @default(autoincrement())
+  eventKey      String    @unique
+  sourceTable   String
+  sourceId      String
+  eventType     String
+  schemaVersion Int       @default(1)
+  payload       Json
+  occurredAt    DateTime  @db.Timestamptz(6)
+  createdAt     DateTime  @default(now()) @db.Timestamptz(6)
+  publishedAt   DateTime? @db.Timestamptz(6)
+
+  @@map("AnalyticsOutbox")
+}
+
+/// Reliable business-event publishing (issue #858). Rows are written in the
+/// same transaction as the business change; a relay publishes pending rows at
+/// least once and stamps `publishedAt`. `idempotencyKey` is unique so consumers
+/// can deduplicate redeliveries.
+model OutboxEvent {
+  id             BigInt    @id @default(autoincrement())
+  idempotencyKey String    @unique
+  topic          String
+  payload        Json
+  occurredAt     DateTime  @db.Timestamptz(6)
+  createdAt      DateTime  @default(now()) @db.Timestamptz(6)
+  publishedAt    DateTime? @db.Timestamptz(6)
+  attempts       Int       @default(0)
+  lastError      String?
+
+  @@index([publishedAt, id])
+  @@index([publishedAt, createdAt])
+  @@map("OutboxEvent")
 }
 
 model EventIndexerState {
@@ -847,8 +938,14 @@ model ApiKey {
   name      String
   scopes    String[]
   revoked   Boolean  @default(false)
+  /// Billing plan identifier. Resolves this key's request quota per billing
+  /// period via the API_KEY_QUOTA_BY_PLAN env var (see apiKeyQuota.ts).
+  /// Unrecognized/unset plans fall back to API_KEY_QUOTA_DEFAULT.
+  plan      String   @default("default")
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  usage     ApiKeyUsage[]
 
   @@index([key])
   @@index([revoked])
@@ -1184,4 +1281,64 @@ model LateFeeWaiverRequest {
   @@index([loanApplicationId, status])
   @@index([status, createdAt])
   @@index([borrowerAddress])
+}
+
+/// Lifecycle of an admin-managed notification template version (issue #825).
+/// At most one version per (key, locale) is Published at any time (enforced by
+/// a partial unique index); Superseded versions were live once and can be
+/// restored by a rollback.
+enum NotificationTemplateStatus {
+  Draft
+  Published
+  Superseded
+}
+
+/// A version of a notification template for one locale. Content is immutable
+/// once published; changing wording means a new version, and going back means
+/// re-publishing an earlier one (rollback), so the full history is retained.
+/// Sends resolve the Published version at dispatch time, so publishing affects
+/// only sends that happen afterwards. Who created / published each version is
+/// stored here; every change is also written to the audit log.
+model NotificationTemplateVersion {
+  id          String                     @id @default(uuid())
+  /// Template identifier from the code registry, e.g. "deposit_receipt".
+  key         String
+  /// Supported locale code: en | es | fr.
+  locale      String
+  /// Monotonic per (key, locale), starting at 1.
+  version     Int
+  status      NotificationTemplateStatus @default(Draft)
+  subject     String
+  /// Message body (HTML) with `{{variable}}` placeholders.
+  body        String
+  changeNote  String?
+  createdBy   String
+  createdAt   DateTime                   @default(now())
+  updatedBy   String?
+  updatedAt   DateTime                   @updatedAt
+  /// Set each time this version goes live (publish or rollback).
+  publishedBy String?
+  publishedAt DateTime?
+
+  @@unique([key, locale, version])
+  @@index([key, locale, status])
+}
+
+/// One execution of a scheduled job, written by the advisory-lock leader
+/// election wrapper (issue #935, services/jobLeaderElection.ts). Records which
+/// instance ran the job. A `running` row left behind by a crashed holder is
+/// marked `abandoned` by the next instance that acquires the job's lock.
+model ScheduledJobRun {
+  id         String    @id @default(uuid())
+  jobName    String
+  instanceId String
+  /// running | succeeded | failed | abandoned
+  status     String    @default("running")
+  startedAt  DateTime
+  finishedAt DateTime?
+  durationMs Int?
+  error      String?
+
+  @@index([jobName, startedAt(sort: Desc)])
+  @@index([jobName, status])
 }
