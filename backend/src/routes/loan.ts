@@ -1,4 +1,7 @@
-import { Router } from "express";
+// Copyright (c) 2026 RemitMortgage Protocol Contributors
+// SPDX-License-Identifier: MIT
+
+import { Router, Response } from "express";
 import { StrKey } from "@stellar/stellar-sdk";
 import logger from "../utils/logger.js";
 import { validatePositiveNumber } from "../middleware/validate.js";
@@ -12,23 +15,77 @@ import {
   resumeDraftApplication,
   discardDraftApplication,
   escrowTargetMetForAmount,
+  StaleVersionError,
 } from "../services/loanStore.js";
+import { applyAutoRejectionIfNeeded } from "../services/autoRejectionRuleStore.js";
 import {
   verifyStellarGuarantorSignature,
   buildGuarantorCommitment,
 } from "../services/guarantor.js";
 import { queueNotification } from "../services/notification.js";
+import { notifyWatchersOfOpenedOffering } from "../services/offeringWatchlist.js";
 import { hasExpiredKycDocuments } from "../jobs/kycExpiryReminder.js";
 import { prisma } from "../services/db.js";
+import {
+  findTaxIdMatches,
+  recordApplicantTaxIdHash,
+  DUPLICATE_TAX_ID_REVIEW_REASON,
+} from "../services/taxIdDedup.js";
 import { reconstructLoanApplicationAt } from "../services/loanHistory.js";
-
-export const loanRouter = Router();
-
 import {
   checkDuplicateApplicants,
   logReviewerDecision,
   ApplicantFields,
 } from "../utils/fuzzyMatch.js";
+import {
+  requireBorrowerAddressOwnership,
+  requireLoanAdmin,
+  requireLoanOwnership,
+} from "../security/requireResourceOwnership.js";
+import type { AuthenticatedRequest } from "../middleware/auth.js";
+
+export const loanRouter = Router();
+
+const REQUIRED_DOCUMENTS_BY_LOAN_TYPE: Record<string, string[]> = {
+  purchase: ["identity", "income", "bank_statement", "property_contract"],
+  construction: ["identity", "income", "bank_statement", "construction_plan"],
+};
+
+// ── Optimistic locking (issue #846) ─────────────────────────────────────────
+//
+// Every reviewer decision must echo back the application version the reviewer
+// was looking at (`expectedVersion`). A missing/invalid token is a 400; a
+// token that no longer matches the record is a 409 carrying the current
+// state, so the client re-reads and re-applies instead of silently
+// overwriting a concurrent decision.
+
+/** Validates the optimistic-lock token; returns null when absent/invalid. */
+function parseExpectedVersion(raw: unknown): number | null {
+  return typeof raw === "number" && Number.isInteger(raw) && raw >= 1 ? raw : null;
+}
+
+/** 409 body: what the client sent, what the record holds now, and the record. */
+function versionConflictResponse(res: Response, expectedVersion: number, current: { version: number }) {
+  return res.status(409).json({
+    error: "version_conflict",
+    message:
+      `Application was modified concurrently: expected version ${expectedVersion}, ` +
+      `current version ${current.version}. Fetch the latest state and retry with the current version.`,
+    expectedVersion,
+    currentVersion: current.version,
+    application: current,
+  });
+}
+
+/** The 400 returned when a decision endpoint is called without the token. */
+function missingExpectedVersionResponse(res: Response) {
+  return res.status(400).json({
+    error: "missing_field",
+    field: "expectedVersion",
+    message:
+      "expectedVersion is required: send the version of the application you reviewed (integer >= 1) so concurrent decisions cannot overwrite each other.",
+  });
+}
 
 // POST /api/loan/apply
 loanRouter.post("/apply", idempotencyMiddleware, validatePositiveNumber("amount"), async (req, res) => {
@@ -96,10 +153,33 @@ loanRouter.post("/apply", idempotencyMiddleware, validatePositiveNumber("amount"
       }
     }
 
+    // Issue #692: exact SSN/tax ID match against other applicants, via a keyed
+    // hash so the raw identifier is never stored or logged.
+    const taxIdMatches = taxId ? await findTaxIdMatches(String(taxId), borrowerAddress) : [];
+
     const app = await createApplication(borrowerAddress, String(amount));
+    if (taxId) {
+      await recordApplicantTaxIdHash(borrowerAddress, String(taxId));
+    }
+    if (taxIdMatches.length > 0) {
+      await prisma.loanApplication.update({
+        where: { id: app.id },
+        data: { manualReviewReason: DUPLICATE_TAX_ID_REVIEW_REASON, version: { increment: 1 } },
+      });
+      app.manualReviewReason = DUPLICATE_TAX_ID_REVIEW_REASON;
+      logger.warn(
+        `Application ${app.id} held for manual review: tax ID matches ${taxIdMatches.length} other applicant(s)`
+      );
+    }
+
     if (dupStatus === "MANUAL_REVIEW") {
       await updateApplication(app.id, { status: "MANUAL_REVIEW" });
       app.status = "MANUAL_REVIEW";
+      return res.status(201).json({ ...app, duplicateCheck: dupDetails });
+    }
+
+    // Held applications skip auto-rejection so a reviewer makes the call.
+    if (app.manualReviewReason) {
       return res.status(201).json({ ...app, duplicateCheck: dupDetails });
     }
 
@@ -131,13 +211,13 @@ loanRouter.post("/apply", idempotencyMiddleware, validatePositiveNumber("amount"
     logger.error("Loan apply error", { error });
     return res.status(500).json({ error: "failed_to_create_application" });
   }
-);
+});
 
 // ---------------------------------------------------------------------------
 // GET /api/loan/borrower/:address
 // ---------------------------------------------------------------------------
 loanRouter.get("/borrower/:address", async (req, res) => {
-  const { address } = req.params ?? {};
+  const address = String(req.params?.address ?? "");
   try {
     StrKey.decodeEd25519PublicKey(address);
   } catch {
@@ -145,6 +225,8 @@ loanRouter.get("/borrower/:address", async (req, res) => {
       .status(400)
       .json({ error: "invalid_address", field: "address", message: "Invalid Stellar G-address" });
   }
+  // Issue #760: borrowers may only list their own applications (admins exempt).
+  if (!requireBorrowerAddressOwnership(req as AuthenticatedRequest, res, address)) return;
   const apps = await getApplicationsByBorrower(address);
   return res.json(apps);
 });
@@ -160,9 +242,17 @@ loanRouter.get("/pending", async (req, res) => {
 // ---------------------------------------------------------------------------
 // POST /api/loan/:id/approve
 loanRouter.post("/:id/approve", idempotencyMiddleware, async (req, res) => {
-  const { id } = req.params;
-  const app = await getApplication(id);
-  if (!app) return res.status(404).json({ error: "not_found" });
+  const id = String(req.params?.id ?? "");
+  // Issue #760: approval is operator-only — even the owning borrower is rejected.
+  const app = await requireLoanAdmin(req as AuthenticatedRequest, res, id);
+  if (!app) return;
+
+  // Optimistic lock (issue #846): echo back the version that was reviewed.
+  // Checked before the state machine so a stale decision reads as a 409 with
+  // the current state rather than a misleading 400 about the old status.
+  const expectedVersion = parseExpectedVersion(req.body?.expectedVersion);
+  if (expectedVersion === null) return missingExpectedVersionResponse(res);
+  if (app.version !== expectedVersion) return versionConflictResponse(res, expectedVersion, app);
 
   if (app.status !== "Pending") {
     return res.status(400).json({
@@ -182,7 +272,11 @@ loanRouter.post("/:id/approve", idempotencyMiddleware, async (req, res) => {
   }
 
   try {
-    const approved = await updateApplication(id, { status: "Approved" });
+    const approved = await updateApplication(
+      id,
+      { status: "Approved" },
+      { expectedVersion }
+    );
 
     // simulate request_loan + approve_loan
     logger.info(`Simulating on-chain request_loan for application ${id}`);
@@ -194,6 +288,10 @@ loanRouter.post("/:id/approve", idempotencyMiddleware, async (req, res) => {
       req.body.webhookUrl || "https://partner-platform.com/webhooks";
 
     if (approved) {
+      // The offering has just opened for investment: tell investors watching
+      // it (issue #799). Best-effort and never throws — must not fail approval.
+      void notifyWatchersOfOpenedOffering(id);
+
       await queueNotification(
         email,
         "EMAIL",
@@ -219,6 +317,11 @@ loanRouter.post("/:id/approve", idempotencyMiddleware, async (req, res) => {
 
     return res.json(disbursing);
   } catch (err) {
+    // Optimistic lock lost between this request's read and its write
+    // (issue #846) — return the record as it stands now.
+    if (err instanceof StaleVersionError) {
+      return versionConflictResponse(res, err.expectedVersion, err.current);
+    }
     logger.error("Approve error", { err });
     return res.status(500).json({ error: "approve_failed" });
   }
@@ -228,10 +331,16 @@ loanRouter.post("/:id/approve", idempotencyMiddleware, async (req, res) => {
 // POST /api/loan/:id/reject
 // ---------------------------------------------------------------------------
 loanRouter.post("/:id/reject", async (req, res) => {
-  const { id } = req.params;
+  const id = String(req.params?.id ?? "");
   const { reason } = req.body ?? {};
-  const app = await getApplication(id);
-  if (!app) return res.status(404).json({ error: "not_found" });
+  // Issue #760: rejection is operator-only — even the owning borrower is rejected.
+  const app = await requireLoanAdmin(req as AuthenticatedRequest, res, id);
+  if (!app) return;
+
+  // Optimistic lock (issue #846) — see POST /:id/approve for rationale.
+  const expectedVersion = parseExpectedVersion(req.body?.expectedVersion);
+  if (expectedVersion === null) return missingExpectedVersionResponse(res);
+  if (app.version !== expectedVersion) return versionConflictResponse(res, expectedVersion, app);
 
   if (app.status !== "Pending") {
     return res.status(400).json({
@@ -240,17 +349,32 @@ loanRouter.post("/:id/reject", async (req, res) => {
     });
   }
 
-  const updated = await updateApplication(id, {
-    status: "Rejected",
-    reason: reason ?? "No reason provided",
-  });
-  return res.json(updated);
+  try {
+    const updated = await updateApplication(
+      id,
+      {
+        status: "Rejected",
+        reason: reason ?? "No reason provided",
+      },
+      { expectedVersion }
+    );
+    return res.json(updated);
+  } catch (err) {
+    if (err instanceof StaleVersionError) {
+      return versionConflictResponse(res, err.expectedVersion, err.current);
+    }
+    logger.error("Reject error", { err });
+    return res.status(500).json({ error: "reject_failed" });
+  }
 });
 
 // POST /api/loan/:id/resume
 // Resumes a Draft application flagged as stale, resetting its inactivity clock.
 loanRouter.post("/:id/resume", async (req, res) => {
-  const { id } = req.params;
+  const id = String(req.params?.id ?? "");
+  // Issue #760: only the owning borrower (or admin) may resume this draft.
+  const owned = await requireLoanOwnership(req as AuthenticatedRequest, res, id);
+  if (!owned) return;
   const resumed = await resumeDraftApplication(id);
   if (!resumed) return res.status(404).json({ error: "not_found_or_not_draft" });
   return res.json(resumed);
@@ -259,7 +383,10 @@ loanRouter.post("/:id/resume", async (req, res) => {
 // POST /api/loan/:id/discard
 // Lets an applicant explicitly discard a Draft application before it would otherwise expire.
 loanRouter.post("/:id/discard", async (req, res) => {
-  const { id } = req.params;
+  const id = String(req.params?.id ?? "");
+  // Issue #760: only the owning borrower (or admin) may discard this draft.
+  const owned = await requireLoanOwnership(req as AuthenticatedRequest, res, id);
+  if (!owned) return;
   const discarded = await discardDraftApplication(id);
   if (!discarded) return res.status(404).json({ error: "not_found_or_not_draft" });
   return res.json(discarded);
@@ -270,8 +397,12 @@ loanRouter.post("/:id/discard", async (req, res) => {
 // from the audit trail as it stood at that instant. Without `asOf`, the
 // current record is returned unchanged.
 loanRouter.get("/:id", async (req, res) => {
-  const { id } = req.params;
+  const id = String(req.params?.id ?? "");
   const asOfRaw = req.query.asOf;
+
+  // Issue #760: loan reads (current and historical) are owner-or-admin only.
+  const owned = await requireLoanOwnership(req as AuthenticatedRequest, res, id);
+  if (!owned) return;
 
   if (asOfRaw !== undefined) {
     if (typeof asOfRaw !== "string") {
@@ -282,8 +413,7 @@ loanRouter.get("/:id", async (req, res) => {
       return res.status(400).json({ error: "invalid_asof", field: "asOf", message: "asOf must be a valid ISO timestamp" });
     }
 
-    const current = await getApplication(id);
-    if (!current) return res.status(404).json({ error: "not_found" });
+    const current = owned;
 
     const historical = await reconstructLoanApplicationAt(id, asOf, {
       // Loans created before the audit trail carried a creation snapshot fall
@@ -301,20 +431,19 @@ loanRouter.get("/:id", async (req, res) => {
     return res.json({ ...historical, asOf: asOf.toISOString() });
   }
 
-  const app = await getApplication(id);
-  if (!app) return res.status(404).json({ error: "not_found" });
-  return res.json(app);
+  return res.json(owned);
 });
 
 // ---------------------------------------------------------------------------
 // POST /api/loan/:id/trigger-payment-due
 // ---------------------------------------------------------------------------
 loanRouter.post("/:id/trigger-payment-due", async (req, res) => {
-  const { id } = req.params;
+  const id = String(req.params?.id ?? "");
   const { email, webhookUrl, amount, dueDate } = req.body ?? {};
 
-  const app = await getApplication(id);
-  if (!app) return res.status(404).json({ error: "not_found" });
+  // Issue #760: only the owning borrower (or admin) may trigger notifications for this loan.
+  const app = await requireLoanOwnership(req as AuthenticatedRequest, res, id);
+  if (!app) return;
 
   const targetEmail = email || `${app.borrowerAddress}@example.com`;
   const targetWebhookUrl =
@@ -387,7 +516,7 @@ loanRouter.post("/check-duplicate", async (req, res) => {
 // Logs manual reviewer decision (APPROVED or REJECTED) and updates loan application status.
 loanRouter.post("/:id/review", async (req, res) => {
   try {
-    const { id } = req.params;
+    const id = String(req.params?.id ?? "");
     const { reviewerId, decision, reason } = req.body ?? {};
 
     if (!reviewerId || !decision || (decision !== "APPROVED" && decision !== "REJECTED")) {
@@ -397,16 +526,28 @@ loanRouter.post("/:id/review", async (req, res) => {
       });
     }
 
-    const app = await getApplication(id);
-    if (!app) return res.status(404).json({ error: "not_found" });
+    // Issue #760: manual review decisions are operator-only.
+    const app = await requireLoanAdmin(req as AuthenticatedRequest, res, id);
+    if (!app) return;
+
+    // Optimistic lock (issue #846): the reviewer must echo the version they
+    // reviewed — checked before mutating anything so a stale decision is
+    // rejected with the current state instead of overwriting a concurrent one.
+    const expectedVersion = parseExpectedVersion(req.body?.expectedVersion);
+    if (expectedVersion === null) return missingExpectedVersionResponse(res);
+    if (app.version !== expectedVersion) return versionConflictResponse(res, expectedVersion, app);
 
     const auditLog = logReviewerDecision(id, reviewerId, decision, reason);
 
     const newStatus = decision === "APPROVED" ? "Pending" : "Rejected";
-    const updated = await updateApplication(id, {
-      status: newStatus,
-      reason: reason || (decision === "APPROVED" ? "Manual review approved" : "Manual review rejected duplicate"),
-    });
+    const updated = await updateApplication(
+      id,
+      {
+        status: newStatus,
+        reason: reason || (decision === "APPROVED" ? "Manual review approved" : "Manual review rejected duplicate"),
+      },
+      { expectedVersion }
+    );
 
     return res.json({
       message: `Application reviewed successfully: set status to ${newStatus}`,
@@ -414,6 +555,9 @@ loanRouter.post("/:id/review", async (req, res) => {
       auditLog,
     });
   } catch (error: any) {
+    if (error instanceof StaleVersionError) {
+      return versionConflictResponse(res, error.expectedVersion, error.current);
+    }
     logger.error("Manual review decision error", { error });
     return res.status(500).json({ error: "failed_to_process_review", message: error.message });
   }
@@ -437,9 +581,10 @@ function extractMentions(content: string): string[] {
  * Also serves as the poll endpoint for real-time display.
  */
 loanRouter.get("/:id/comments", async (req, res) => {
-  const { id } = req.params;
-  const app = await getApplication(id);
-  if (!app) return res.status(404).json({ error: "not_found" });
+  const id = String(req.params?.id ?? "");
+  // Issue #760: comment threads are owner-or-admin only.
+  const app = await requireLoanOwnership(req as AuthenticatedRequest, res, id);
+  if (!app) return;
 
   const comments = await prisma.loanComment.findMany({
     where: { loanApplicationId: id },
@@ -470,7 +615,7 @@ loanRouter.get("/:id/comments", async (req, res) => {
  * and persists to audit trail.
  */
 loanRouter.post("/:id/comments", async (req, res) => {
-  const { id } = req.params;
+  const id = String(req.params?.id ?? "");
   const { authorAddress, author, content, parentId } = req.body ?? {};
   const authorAddr = authorAddress || author;
 
@@ -484,8 +629,9 @@ loanRouter.post("/:id/comments", async (req, res) => {
     return res.status(400).json({ error: "invalid_request", message: "content too long (max 5000)" });
   }
 
-  const app = await getApplication(id);
-  if (!app) return res.status(404).json({ error: "not_found" });
+  // Issue #760: comment threads are owner-or-admin only; the caller must own the loan.
+  const app = await requireLoanOwnership(req as AuthenticatedRequest, res, id);
+  if (!app) return;
 
   if (parentId) {
     const parent = await prisma.loanComment.findUnique({ where: { id: parentId } });
@@ -556,4 +702,3 @@ loanRouter.post("/:id/comments", async (req, res) => {
     return res.status(500).json({ error: "failed_to_create_comment" });
   }
 });
-

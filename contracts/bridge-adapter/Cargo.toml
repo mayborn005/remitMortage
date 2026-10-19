@@ -7,8 +7,16 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 doctest = false
 
+[features]
+# Enables the shared, interface-level compliance suite (and the SDK test
+# utilities it needs) for other crates verifying their own BridgeAdapter
+# implementation.
+compliance-tests = ["soroban-sdk/testutils"]
+
 [dependencies]
 soroban-sdk = { workspace = true }
 
 [dev-dependencies]
+proptest = "1"
 soroban-sdk = { workspace = true, features = ["testutils"] }
+
