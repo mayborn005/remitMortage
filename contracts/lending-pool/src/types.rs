@@ -13,6 +13,68 @@ pub struct PendingUpgradeRecord {
     pub execute_after: u32,
 }
 
+/// A pending, timelocked change to an asset class's collateral haircut.
+/// The asset class itself is the storage key (`FeatureKey::PendingHaircutChange`),
+/// not stored redundantly here.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingHaircutChange {
+    /// The haircut value queued to take effect.
+    pub haircut_bps: u32,
+    /// The ledger sequence after which this change may execute.
+    pub execute_after: u32,
+}
+
+/// A pending, timelocked change to a deposit cap (per tranche or per
+/// investor). Which cap it applies to is encoded in the storage key it is
+/// held under (`FeatureKey::PendingTrancheCap` / `PendingInvestorCap`).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingCapChange {
+    /// The cap value queued to take effect. `0` removes the cap.
+    pub cap: i128,
+    /// The ledger sequence after which this change may be executed.
+    pub execute_after: u32,
+}
+
+/// What an investor's position does with the yield it earns.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum YieldMode {
+    /// Yield is paid out to the investor by `claim_yield`. The default.
+    Claim = 0,
+    /// Yield is added to the position's principal, in the same tranche, by
+    /// `compound_yield`.
+    Compound = 1,
+}
+
+/// Lifecycle state of the pool's orderly wind-down process.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+#[repr(u32)]
+pub enum WindDownStatus {
+    /// Normal operation: deposits, loan requests and withdrawals all work
+    /// exactly as they always have.
+    Active = 0,
+    /// New deposits and loan requests are rejected; repayments continue;
+    /// investors withdraw via `withdraw_during_wind_down`, pro rata by
+    /// tranche seniority, as liquidity returns.
+    WindingDown = 1,
+    /// All loans have been resolved (`ActiveLoanCommitments == 0`) and
+    /// `finalize_wind_down` has been called. Withdrawals continue to be
+    /// available until every investor has been paid out.
+    Finalized = 2,
+}
+
+/// A pending, timelocked proposal to start wind-down.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingWindDown {
+    /// The ledger sequence after which wind-down may actually start.
+    pub execute_after: u32,
+}
+
 /// Tranche types for risk stratification of investor deposits.
 ///
 /// Senior tranche offers a lower, fixed yield rate but is protected from losses.
@@ -555,6 +617,66 @@ pub enum FeatureKey {
     /// Independent pause flag for one function group, alongside the global
     /// pause. Absent means unpaused, so existing deployments are unaffected.
     FunctionPaused(PauseGroup),
+    /// Revolving credit line keyed by borrower address.
+    CreditLine(Address),
+    /// Lockup-tier position for an investor.
+    InvestorLockup(Address),
+    /// Accumulated funds reserved to pay lockup bonuses.
+    LockupBonusPool,
+    /// Share (bps) of the protocol fee routed to the lockup bonus pool.
+    LockupBonusFeeShareBps,
+    /// Number of extensions already granted to a loan.
+    LoanExtensionCount(BytesN<32>),
+    /// Maximum number of extensions a single loan may receive.
+    MaxExtensionsPerLoan,
+    /// Maximum term, in months, of a single loan extension.
+    MaxExtensionMonths,
+    /// Extension fee, in basis points.
+    ExtensionFeeBps,
+    /// Interest-only intro configuration for a loan.
+    LoanInterestOnly(BytesN<32>),
+    /// Maximum permitted interest-only intro period, in months.
+    MaxInterestOnlyMonths,
+    /// Admin-set maximum total deposits for a tranche, in token stroops.
+    /// Absent or zero means uncapped.
+    TrancheDepositCap(Tranche),
+    /// Admin-set maximum position size of a single investor, in token
+    /// stroops. Absent or zero means uncapped.
+    InvestorDepositCap,
+    /// Pending timelocked change to a tranche's deposit cap.
+    PendingTrancheCap(Tranche),
+    /// Pending timelocked change to the per-investor deposit cap.
+    PendingInvestorCap,
+    /// Ledgers that must elapse between proposing and executing a deposit
+    /// cap change. Absent means `DEFAULT_CAP_CHANGE_DELAY_LEDGERS`.
+    DepositCapChangeDelay,
+    /// Ceiling on late fees per billing period, as an absolute amount in
+    /// token stroops. Absent or zero disables this limb of the cap.
+    LateFeeCapAbs,
+    /// Ceiling on late fees per billing period, in basis points of the
+    /// installment. Absent or zero disables this limb of the cap.
+    LateFeeCapBps,
+    /// Fee charged to the incoming borrower on `assume_loan`, in basis points
+    /// of the loan's outstanding principal. Absent or zero means no fee.
+    /// Never above `MAX_ASSUMPTION_FEE_BPS`.
+    AssumptionFeeBps,
+    /// An investor's yield mode. Absent means `YieldMode::Claim`.
+    YieldMode(Address),
+    /// Configured collateral haircut (bps) for an asset class. Absent means
+    /// no haircut (0 bps) — face value counts in full toward ratio checks.
+    AssetClassHaircut(Symbol),
+    /// Pending timelocked haircut change for an asset class.
+    PendingHaircutChange(Symbol),
+    /// Ledgers that must elapse between proposing and executing a haircut
+    /// change. `0` disables the timelock (changes apply immediately).
+    HaircutChangeDelay,
+    /// The pool's wind-down lifecycle state. Absent means `Active`.
+    WindDownStatus,
+    /// Pending timelocked wind-down start.
+    PendingWindDown,
+    /// Ledgers that must elapse between proposing and executing wind-down.
+    /// `0` disables the timelock (wind-down starts immediately).
+    WindDownDelay,
 }
 
 /// Function groups that can be paused independently of the global pause.
@@ -589,12 +711,19 @@ pub struct LoanAssumptionRequest {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoanCollateralRecord {
-    /// Initial locked collateral amount.
+    /// Initial locked collateral amount, at face value.
     pub initial_collateral: i128,
-    /// Total collateral amount released to borrower so far.
+    /// Total collateral amount released to borrower so far, at face value.
     pub released_collateral: i128,
-    /// Minimum required collateralization ratio in basis points (e.g. 3000 = 30%).
+    /// Minimum required collateralization ratio in basis points (e.g. 3000 = 30%),
+    /// checked against the haircut-adjusted (not face) value of the remaining
+    /// collateral.
     pub min_collateral_ratio_bps: u32,
+    /// The collateral's asset class, used to look up its configured haircut
+    /// (`FeatureKey::AssetClassHaircut`) when computing collateralization ratios.
+    /// Does not affect the face-value amounts above — only how much of that
+    /// face value counts toward meeting `min_collateral_ratio_bps`.
+    pub asset_class: Symbol,
 }
 
 /// A locked payoff quote: the exact amount that settles the loan if paid
@@ -608,4 +737,109 @@ pub struct PayoffQuote {
     pub quoted_at_ledger: u32,
     /// Last ledger at which the quote is still valid (inclusive).
     pub expires_ledger: u32,
+}
+
+/// A revolving credit line secured against a borrower's escrow position,
+/// similar to a HELOC: once approved, the borrower may draw and repay
+/// repeatedly up to `approved_limit` without re-applying for a new loan.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreditLine {
+    /// The borrower's address.
+    pub borrower: Address,
+    /// Maximum balance the borrower may have drawn at any one time.
+    pub approved_limit: i128,
+    /// Currently drawn (outstanding) balance, including accrued interest.
+    pub drawn_balance: i128,
+    /// Annual interest rate in basis points, charged only on `drawn_balance`.
+    pub interest_rate_bps: u32,
+    /// Ledger when the credit line was opened.
+    pub opened_ledger: u32,
+    /// Ledger sequence when interest was last accrued on `drawn_balance`.
+    pub last_interest_ledger: u32,
+}
+
+/// Lockup tiers for investors with commitment duration and bonus yield.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum LockupTier {
+    /// No commitment: standard liquidity, 0 bps bonus yield.
+    None = 0,
+    /// 90-day lockup commitment with 100 bps (1.0%) bonus yield.
+    Tier90Days = 1,
+    /// 180-day lockup commitment with 250 bps (2.5%) bonus yield.
+    Tier180Days = 2,
+    /// 365-day lockup commitment with 500 bps (5.0%) bonus yield.
+    Tier365Days = 3,
+}
+
+impl LockupTier {
+    pub fn days(&self) -> u32 {
+        match self {
+            LockupTier::None => 0,
+            LockupTier::Tier90Days => 90,
+            LockupTier::Tier180Days => 180,
+            LockupTier::Tier365Days => 365,
+        }
+    }
+
+    pub fn bonus_bps(&self) -> u32 {
+        match self {
+            LockupTier::None => 0,
+            LockupTier::Tier90Days => 100,
+            LockupTier::Tier180Days => 250,
+            LockupTier::Tier365Days => 500,
+        }
+    }
+}
+
+/// Tracks an investor's lockup tier position.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct InvestorLockupPosition {
+    pub tier: LockupTier,
+    pub unlock_ledger: u32,
+    pub bonus_bps: u32,
+    /// Ledger from which bonus accrual is measured. Set once when the
+    /// position first adopts a non-`None` tier, and never reset by a
+    /// top-up — a top-up extends `unlock_ledger` (never shortens it) and
+    /// may raise `bonus_bps` if the new tier pays more, but accrual keeps
+    /// counting from the original commitment.
+    pub bonus_start_ledger: u32,
+    /// Total bonus already paid out via `claim_lockup_bonus`. Pending bonus
+    /// is always computed as total accrued minus this.
+    pub claimed_bonus: i128,
+}
+
+/// Lifecycle phase of a loan (interest-only vs amortizing).
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum LoanPhase {
+    /// Principal amortizes with each payment.
+    Amortizing = 0,
+    /// Payments cover accrued interest only; principal remains unchanged.
+    InterestOnly = 1,
+}
+
+/// Intro interest-only configuration stored per loan.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoanIntroConfig {
+    pub interest_only_months: u32,
+    pub phase: LoanPhase,
+}
+
+/// Detailed schedule view including loan repayment phase.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScheduleView {
+    pub monthly_amount: i128,
+    pub duration_months: u32,
+    pub next_due_ledger: u32,
+    pub payments_made: u32,
+    pub payments_missed: u32,
+    pub interest_only_months: u32,
+    pub phase: LoanPhase,
 }
